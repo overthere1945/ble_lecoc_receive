@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="GradleMigrationSettings" migrationVersion="1" />
+  <component name="GradleSettings">
+    <option name="linkedExternalProjectsSettings">
+      <GradleProjectSettings>
+        <option name="testRunner" value="CHOOSE_PER_TEST" />
+        <option name="externalProjectPath" value="$PROJECT_DIR$" />
+        <option name="gradleJvm" value="#GRADLE_LOCAL_JAVA_HOME" />
+        <option name="modules">
+          <set>
+            <option value="/media/hyungchul/External_2TB/hdd_2TB/workspace/android_project/qc_ble_receive" />
+            <option value="/media/hyungchul/External_2TB/hdd_2TB/workspace/android_project/qc_ble_receive/app" />
+          </set>
+        </option>
+      </GradleProjectSettings>
+      <GradleProjectSettings>
+        <option name="testRunner" value="CHOOSE_PER_TEST" />
+        <option name="externalProjectPath" value="/media/hyungchul/External_2TB/hdd_2TB/workspace/android_project/qc_ble_receive" />
+        <option name="gradleJvm" value="#GRADLE_LOCAL_JAVA_HOME" />
+        <option name="modules">
+          <set>
+            <option value="/media/hyungchul/External_2TB/hdd_2TB/workspace/android_project/qc_ble_receive" />
+            <option value="/media/hyungchul/External_2TB/hdd_2TB/workspace/android_project/qc_ble_receive/app" />
+          </set>
+        </option>
+      </GradleProjectSettings>
+    </option>
+  </component>
+</project>
