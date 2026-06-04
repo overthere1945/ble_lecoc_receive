@@ -4,15 +4,13 @@ package com.example.qc_ble_receive;
  * 파일명: MainActivity.java
  * 목적 및 기능:
  * - qc_ble_receive Mobile Client Application의 UI와 runtime permission을 처리한다.
- * - QC_BLE_T scan, GATT PSM read, LE CoC client connect는 QcBleReceiveManager가 수행한다.
- * - 수신/출력 log는 가장 최근 메시지가 화면 최상단에 표시되도록 prepend 방식으로 출력한다.
- * - CLEAR 버튼으로 화면의 모든 log text를 삭제한다.
- * - START SCAN 버튼으로 QC_BLE_T Target Device를 scan한다.
- * - Android 12 이상에서도 ACCESS_FINE_LOCATION 권한을 명시적으로 확인하고 없으면 재요청한다.
- * - 사용자가 approximate location만 허용한 경우 FINE location 권한이 없으므로 재요청 또는 App Settings 이동을 안내한다.
+ * - START SCAN 버튼으로 QC_BLE_T Target Device를 scan하고 LE CoC 수신을 시작한다.
+ * - STOP 버튼으로 BLE scan/GATT/LE CoC 연결을 모두 끊는다.
+ * - CLEAR 버튼으로 JPG viewer 화면과 수신 중인 JPG 조립 buffer를 비운다.
+ * - Target Device에서 CJPG fragment header와 함께 송신하는 a_car_jpg/b_car_jpg를
+ *   QcBleReceiveManager가 재조립하면 ImageView에 표시한다.
  *
- * change(add)-hyungchul-20260513-1705: ACCESS_FINE_LOCATION runtime check/re-request 및 location service ON 확인 추가.
- * change(add)-hyungchul-20260515-0001: 최신 수신 메시지 최상단 표시 및 CLEAR 버튼 기능 추가.
+ * change(add)-hyungchul-20260521-0001: Hello World 수신 UI를 JPG viewer UI로 변경.
  */
 
 import android.Manifest;
@@ -21,15 +19,16 @@ import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothManager;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.location.LocationManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.provider.Settings;
 import android.widget.Button;
-import android.widget.EditText;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
-import android.widget.ScrollView;
 import android.widget.TextView;
 
 import java.text.SimpleDateFormat;
@@ -38,15 +37,32 @@ import java.util.Date;
 import java.util.Locale;
 
 public final class MainActivity extends Activity {
+    // change(add)-hyungchul-20260522-1103: 클래스 멤버 변수 설명 주석 추가
+    // 런타임 권한 요청 시 결과를 식별하기 위한 Request Code 상수
     private static final int REQ_PERMISSIONS = 1001;
+    // UI의 텍스트 뷰에 표시할 최대 로그 라인 수 상수
+    private static final int MAX_STATUS_LINES = 8;
 
-    private TextView logView;
-    private EditText manualPsmEditText;
+    // 프로그램 상태 및 로그를 화면에 텍스트 형태로 출력하기 위한 뷰
+    private TextView statusView;
+    // 수신 및 조립이 완료된 JPEG 이미지를 화면에 렌더링하기 위한 이미지 뷰
+    private ImageView jpgImageView;
+    // BLE 스캔, GATT 연결 및 LE CoC 통신을 총괄하는 매니저 객체
     private QcBleReceiveManager manager;
+    // 권한 요청 후, 권한이 승인되면 자동으로 스캔을 다시 시작할지 여부를 저장하는 플래그
     private boolean pendingStartScanAfterPermission;
 
+    // 현재 텍스트 뷰에 표시 중인 로그 라인들을 저장하는 리스트 (최대 MAX_STATUS_LINES 유지)
+    private final ArrayList<String> statusLines = new ArrayList<>();
+
+    // QcBleReceiveManager에서 발생하는 로그 메시지를 UI 스레드에서 statusView에 추가하기 위한 콜백 리스너
     private final QcBleReceiveManager.Logger logger =
-            message -> runOnUiThread(() -> appendLog(message));
+            message -> runOnUiThread(() -> appendStatus(message));
+
+    // 완성된 JPEG 데이터를 QcBleReceiveManager로부터 전달받아 UI 스레드에서 화면에 표시하기 위한 콜백 리스너
+    private final QcBleReceiveManager.JpegImageListener jpegImageListener =
+            (jpegData, imageId, imageB, totalLen, fragCount) ->
+                    runOnUiThread(() -> showJpegImage(jpegData, imageId, imageB, totalLen, fragCount));
 
     /*
      * 함수명: onCreate
@@ -56,106 +72,79 @@ public final class MainActivity extends Activity {
      * - runtime permission을 요청한다.
      *
      * 입력 변수:
-     * - savedInstanceState: Android Activity restore state
+     * - savedInstanceState: Android Activity restore state (이전 액티비티 상태 정보)
      *
-     * 출력 변수:
-     * - 없음
-     *
-     * 리턴 값:
+     * 출력 변수/리턴 값:
      * - 없음
      */
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        logView = new TextView(this);
-        logView.setTextSize(12.0f);
-        logView.setTextIsSelectable(true);
-
-        manualPsmEditText = new EditText(this);
-        manualPsmEditText.setHint("Manual PSM, example: 128");
-        manualPsmEditText.setSingleLine(true);
-        manualPsmEditText.setText("");
-
+        // START SCAN 버튼 생성 및 클릭 이벤트 매핑
         Button startButton = new Button(this);
         startButton.setText("START SCAN");
         startButton.setOnClickListener(v -> startScan());
 
+        // STOP 버튼 생성 및 클릭 이벤트 매핑 (BLE 연결 종료)
         Button stopButton = new Button(this);
         stopButton.setText("STOP");
-        stopButton.setOnClickListener(v -> stopAll());
+        stopButton.setOnClickListener(v -> stopBleConnection());
 
+        // CLEAR 버튼 생성 및 클릭 이벤트 매핑 (이미지 및 버퍼 초기화)
         Button clearButton = new Button(this);
         clearButton.setText("CLEAR");
-        clearButton.setOnClickListener(v -> clearLogs());
+        clearButton.setOnClickListener(v -> clearJpgViewer());
 
-        Button checkPermissionButton = new Button(this);
-        checkPermissionButton.setText("CHECK PERMISSION");
-        checkPermissionButton.setOnClickListener(v -> {
-            appendLog("CHECK PERMISSION clicked.");
-            logPermissionState();
-            if (!hasNeededPermissions()) {
-                requestNeededPermissions();
-            }
-            if (!isLocationServiceEnabled()) {
-                openLocationSettings();
-            }
-        });
+        // 상단 버튼 3개를 가로로 배치하기 위한 레이아웃 구성
+        LinearLayout buttonLine = new LinearLayout(this);
+        buttonLine.setOrientation(LinearLayout.HORIZONTAL);
+        buttonLine.addView(startButton, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0f));
+        buttonLine.addView(stopButton, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0f));
+        buttonLine.addView(clearButton, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0f));
 
-        Button appSettingsButton = new Button(this);
-        appSettingsButton.setText("APP SETTINGS");
-        appSettingsButton.setOnClickListener(v -> openAppSettings());
+        // 상태 로그를 출력할 텍스트 뷰 속성 설정
+        statusView = new TextView(this);
+        statusView.setTextSize(12.0f);
+        statusView.setTextIsSelectable(true);
+        statusView.setPadding(0, 12, 0, 12);
 
-        Button manualConnectButton = new Button(this);
-        manualConnectButton.setText("CONNECT MANUAL PSM");
-        manualConnectButton.setOnClickListener(v -> connectManualPsm());
+        // 수신된 이미지를 표시할 이미지 뷰 속성 설정 (비율 유지, 배경색 지정)
+        jpgImageView = new ImageView(this);
+        jpgImageView.setAdjustViewBounds(true);
+        jpgImageView.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        jpgImageView.setBackgroundColor(0xFF202020);
+        jpgImageView.setContentDescription("Received JPG image viewer");
 
-        Button sendTestButton = new Button(this);
-        sendTestButton.setText("SEND TEST");
-        sendTestButton.setOnClickListener(v -> sendTest());
-
-        LinearLayout firstButtonLine = new LinearLayout(this);
-        firstButtonLine.setOrientation(LinearLayout.HORIZONTAL);
-        firstButtonLine.addView(startButton, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0f));
-        firstButtonLine.addView(stopButton, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0f));
-        firstButtonLine.addView(clearButton, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0f));
-
-        LinearLayout secondButtonLine = new LinearLayout(this);
-        secondButtonLine.setOrientation(LinearLayout.HORIZONTAL);
-        secondButtonLine.addView(checkPermissionButton, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0f));
-        secondButtonLine.addView(appSettingsButton, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0f));
-
-        LinearLayout thirdButtonLine = new LinearLayout(this);
-        thirdButtonLine.setOrientation(LinearLayout.HORIZONTAL);
-        thirdButtonLine.addView(manualConnectButton, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0f));
-        thirdButtonLine.addView(sendTestButton, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0f));
-
-        ScrollView scrollView = new ScrollView(this);
-        scrollView.addView(logView);
-
+        // 전체 화면을 구성하는 최상단 수직 레이아웃 조립
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(24, 40, 24, 24);
-        root.addView(firstButtonLine);
-        root.addView(secondButtonLine);
-        root.addView(manualPsmEditText);
-        root.addView(thirdButtonLine);
-        root.addView(scrollView, new LinearLayout.LayoutParams(
+        root.addView(buttonLine);
+        root.addView(statusView, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+        root.addView(jpgImageView, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 0,
                 1.0f));
 
+        // 조립된 UI 레이아웃을 Activity 화면으로 설정
         setContentView(root);
 
+        // 시스템 서비스로부터 BluetoothManager 및 Adapter 획득
         BluetoothManager bluetoothManager = getSystemService(BluetoothManager.class);
         BluetoothAdapter adapter = bluetoothManager != null ? bluetoothManager.getAdapter() : null;
 
-        manager = new QcBleReceiveManager(this, adapter, logger);
+        // BLE 수신 관리를 담당할 QcBleReceiveManager 인스턴스 초기화
+        manager = new QcBleReceiveManager(this, adapter, logger, jpegImageListener);
 
-        appendLog("qc_ble_receive started.");
-        appendLog("Target: QC_BLE_T, service=0000ff01, PSM char=0000ff02.");
+        // 초기 앱 시작 로그 출력
+        appendStatus("qc_ble_receive JPG viewer started.");
+        appendStatus("Target: QC_BLE_T, service=0000ff01, PSM char=0000ff02.");
+        appendStatus("RX protocol: CJPG header + JPG chunk, a_car_jpg/b_car_jpg alternate display.");
         logPermissionState();
-        requestNeededPermissions();
+        requestNeededPermissions(); // 필수 권한 요청 수행
     }
 
     /*
@@ -171,13 +160,15 @@ public final class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
 
+        // 화면이 다시 활성화될 때 현재 권한 상태를 로그로 출력
         if (manager != null) {
             logPermissionState();
         }
 
+        // 권한 획득 대기 상태였고, 권한과 위치 서비스가 모두 켜져있다면 자동 스캔 재개
         if (pendingStartScanAfterPermission && hasNeededPermissions() && isLocationServiceEnabled()) {
             pendingStartScanAfterPermission = false;
-            appendLog("Permissions/location are ready. Restart scan automatically.");
+            appendStatus("Permissions/location are ready. Restart scan automatically.");
             manager.startScan();
         }
     }
@@ -185,14 +176,19 @@ public final class MainActivity extends Activity {
     /*
      * 함수명: onDestroy
      * 목적 및 기능:
-     * - Activity 종료 시 BLE/GATT/L2CAP resource를 정리한다.
+     * - Activity 종료 시 BLE/GATT/L2CAP resource와 worker thread를 정리한다.
      *
      * 입력 변수/출력 변수/리턴 값:
      * - 없음
      */
     @Override
     protected void onDestroy() {
-        stopAll();
+        // 매니저 객체가 존재할 경우 할당된 모든 시스템 자원을 해제
+        if (manager != null) {
+            manager.shutdown();
+            manager = null;
+        }
+
         super.onDestroy();
     }
 
@@ -204,9 +200,9 @@ public final class MainActivity extends Activity {
      * - 모든 조건이 만족되면 pending scan을 자동 시작한다.
      *
      * 입력 변수:
-     * - requestCode: permission request code
+     * - requestCode: permission request code (요청 시 전달한 식별 코드)
      * - permissions: 요청한 permission 배열
-     * - grantResults: grant 결과 배열
+     * - grantResults: grant 결과 배열 (PERMISSION_GRANTED 또는 PERMISSION_DENIED)
      *
      * 출력 변수/리턴 값:
      * - 없음
@@ -218,38 +214,44 @@ public final class MainActivity extends Activity {
             int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
 
+        // 본 앱에서 요청한 권한 응답이 아니면 무시
         if (requestCode != REQ_PERMISSIONS) {
             return;
         }
 
-        appendLog("onRequestPermissionsResult()");
+        appendStatus("onRequestPermissionsResult()");
+        // 요청된 각 권한에 대한 승인/거절 여부를 로그로 기록
         for (int i = 0; i < permissions.length; i++) {
             int result = (grantResults != null && i < grantResults.length) ? grantResults[i] : PackageManager.PERMISSION_DENIED;
-            appendLog("  " + permissions[i] + " granted=" + (result == PackageManager.PERMISSION_GRANTED));
+            appendStatus("  " + permissions[i] + " granted=" + (result == PackageManager.PERMISSION_GRANTED));
         }
 
         logPermissionState();
 
+        // 정밀 위치 권한이 필수이므로 거부되었을 경우 설정 화면으로 유도
         if (!hasFineLocationPermission()) {
-            appendLog("ACCESS_FINE_LOCATION is still denied.");
-            appendLog("Choose Precise location, not Approximate. Use APP SETTINGS if dialog does not appear.");
+            appendStatus("ACCESS_FINE_LOCATION is still denied. Choose Precise location in App Settings.");
+            openAppSettings();
             return;
         }
 
+        // 안드로이드 버전에 따른 블루투스 스캔/연결 권한 미충족 시 안내
         if (!hasNeededPermissions()) {
-            appendLog("Some Bluetooth permissions are still denied.");
+            appendStatus("Some Bluetooth permissions are still denied.");
             return;
         }
 
+        // 위치 서비스 자체가 꺼져 있는 경우 위치 설정 화면으로 유도
         if (!isLocationServiceEnabled()) {
-            appendLog("Location service is OFF. Open location settings.");
+            appendStatus("Location service is OFF. Open location settings.");
             openLocationSettings();
             return;
         }
 
-        if (pendingStartScanAfterPermission) {
+        // 스캔을 대기 중이었고 매니저가 활성화 상태라면 스캔 자동 시작
+        if (pendingStartScanAfterPermission && manager != null) {
             pendingStartScanAfterPermission = false;
-            appendLog("All permissions granted. Start scan automatically.");
+            appendStatus("All permissions granted. Start scan automatically.");
             manager.startScan();
         }
     }
@@ -265,92 +267,113 @@ public final class MainActivity extends Activity {
      * - 없음
      */
     private void startScan() {
-        appendLog("START SCAN clicked.");
+        appendStatus("START SCAN clicked.");
         logPermissionState();
 
+        // 필요 권한이 없는 경우 다시 권한을 요청하고 대기 상태로 전환
         if (!hasNeededPermissions()) {
-            appendLog("Permission is not granted. Request permissions again.");
+            appendStatus("Permission is not granted. Request permissions again.");
             pendingStartScanAfterPermission = true;
             requestNeededPermissions();
             return;
         }
 
+        // 권한은 있으나 기기의 위치 서비스 기능 자체가 꺼져 있는 경우
         if (!isLocationServiceEnabled()) {
-            appendLog("Location service is OFF. BLE scan result may be blocked.");
+            appendStatus("Location service is OFF. BLE scan result may be blocked.");
             pendingStartScanAfterPermission = true;
             openLocationSettings();
             return;
         }
 
         pendingStartScanAfterPermission = false;
-        manager.startScan();
+
+        // 모든 조건이 만족되면 매니저를 통해 실제 BLE 스캔 호출
+        if (manager != null) {
+            manager.startScan();
+        }
     }
 
     /*
-     * 함수명: stopAll
+     * 함수명: stopBleConnection
      * 목적 및 기능:
-     * - scan, GATT, LE CoC socket을 모두 정리한다.
+     * - STOP 버튼 동작으로 scan, GATT, LE CoC socket을 모두 정리한다.
+     * - 화면에 표시된 마지막 JPG 이미지는 유지한다.
      *
      * 입력 변수/출력 변수/리턴 값:
      * - 없음
      */
-    private void stopAll() {
-        appendLog("STOP clicked.");
+    private void stopBleConnection() {
+        appendStatus("STOP clicked. Disconnect BLE.");
+        pendingStartScanAfterPermission = false;
 
+        // 매니저를 통해 활성화된 모든 BLE 관련 연결 및 자원을 해제
         if (manager != null) {
             manager.stopAll();
         }
     }
 
     /*
-     * 함수명: clearLogs
+     * 함수명: clearJpgViewer
      * 목적 및 기능:
-     * - 화면에 표시된 모든 log text를 삭제한다.
+     * - CLEAR 버튼 동작으로 JPG viewer 이미지를 비운다.
+     * - 수신 중이던 incomplete JPG 조립 buffer도 함께 초기화한다.
      * - BLE 연결은 끊지 않는다.
      *
      * 입력 변수/출력 변수/리턴 값:
      * - 없음
      */
-    private void clearLogs() {
-        logView.setText("");
+    private void clearJpgViewer() {
+        // 화면에 출력된 이미지 제거
+        jpgImageView.setImageDrawable(null);
+
+        // 백그라운드에서 수신 및 조립 중이던 내부 버퍼 데이터 폐기
+        if (manager != null) {
+            manager.clearReceivedImageBuffers();
+        }
+
+        appendStatus("CLEAR clicked. JPG viewer and RX buffers cleared.");
     }
 
     /*
-     * 함수명: connectManualPsm
+     * 함수명: showJpegImage
      * 목적 및 기능:
-     * - manualPsmEditText에 입력된 PSM으로 마지막 발견 device에 LE CoC client 연결을 시도한다.
+     * - QcBleReceiveManager가 재조립한 JPEG byte array를 Bitmap으로 decode한다.
+     * - decode가 성공하면 ImageView에 표시한다.
      *
-     * 입력 변수/출력 변수/리턴 값:
+     * 입력 변수:
+     * - jpegData: 완성된 JPEG byte array (파일 전체 데이터)
+     * - imageId: target device가 붙인 image sequence id
+     * - imageB: true이면 b_car_jpg, false이면 a_car_jpg (이미지 종류 식별)
+     * - totalLen: JPEG 전체 길이 (바이트 수)
+     * - fragCount: 수신 fragment(청크) 수
+     *
+     * 출력 변수/리턴 값:
      * - 없음
      */
-    private void connectManualPsm() {
-        if (!hasNeededPermissions()) {
-            appendLog("Permission is not granted. Request permissions again.");
-            pendingStartScanAfterPermission = false;
-            requestNeededPermissions();
+    private void showJpegImage(byte[] jpegData, long imageId, boolean imageB, int totalLen, int fragCount) {
+        if (jpegData == null || jpegData.length == 0) {
+            appendStatus("JPG decode skipped: empty data.");
             return;
         }
 
-        try {
-            int psm = Integer.parseInt(manualPsmEditText.getText().toString().trim());
-            appendLog("CONNECT MANUAL PSM clicked. psm=" + psm);
-            manager.connectLastDeviceWithPsm(psm);
-        } catch (NumberFormatException e) {
-            appendLog("Invalid manual PSM. Please enter decimal PSM, example: 128.");
+        // 바이트 배열을 안드로이드 Bitmap 객체로 디코딩
+        Bitmap bitmap = BitmapFactory.decodeByteArray(jpegData, 0, jpegData.length);
+        if (bitmap == null) {
+            appendStatus("JPG decode failed. imageId=" + imageId + ", len=" + jpegData.length);
+            return;
         }
-    }
 
-    /*
-     * 함수명: sendTest
-     * 목적 및 기능:
-     * - 연결된 LE CoC socket으로 test payload를 전송한다.
-     *
-     * 입력 변수/출력 변수/리턴 값:
-     * - 없음
-     */
-    private void sendTest() {
-        appendLog("SEND TEST clicked.");
-        manager.sendTestMessage();
+        // 성공적으로 디코딩된 이미지를 UI 뷰에 세팅
+        jpgImageView.setImageBitmap(bitmap);
+
+        // 표시 완료된 이미지 정보를 로그로 출력
+        String imageName = imageB ? "b_car_jpg" : "a_car_jpg";
+        appendStatus("Displayed " + imageName
+                + ", imageId=" + imageId
+                + ", bytes=" + totalLen
+                + ", fragments=" + fragCount
+                + ", bitmap=" + bitmap.getWidth() + "x" + bitmap.getHeight());
     }
 
     /*
@@ -363,14 +386,15 @@ public final class MainActivity extends Activity {
      * - 없음
      *
      * 리턴 값:
-     * - true: 필요한 permission이 모두 있음
-     * - false: 필요한 permission이 부족함
+     * - boolean: true(필요한 permission이 모두 있음), false(부족함)
      */
     private boolean hasNeededPermissions() {
+        // 정밀 위치 권한 검사
         if (!hasFineLocationPermission()) {
             return false;
         }
 
+        // 안드로이드 12(API 31) 이상일 경우, 분리된 블루투스 스캔 및 연결 권한을 추가 검사
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             return checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
                     && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED;
@@ -380,17 +404,14 @@ public final class MainActivity extends Activity {
     }
 
     /*
+     * change(add)-hyungchul-20260522-1103: 누락된 함수 주석 추가
      * 함수명: hasFineLocationPermission
      * 목적 및 기능:
-     * - ACCESS_FINE_LOCATION이 grant되었는지 확인한다.
-     * - Android 12 이상에서도 Bluetooth stack이 FINE location을 요구하는 vendor path를 대응한다.
+     * - 앱이 ACCESS_FINE_LOCATION(정밀 위치) 권한을 획득했는지 확인한다.
      *
-     * 입력 변수/출력 변수:
-     * - 없음
-     *
-     * 리턴 값:
-     * - true: ACCESS_FINE_LOCATION grant됨
-     * - false: ACCESS_FINE_LOCATION grant 안 됨
+     * 입력 변수: 없음
+     * 출력 변수/리턴 값:
+     * - boolean: true(권한 있음), false(권한 없음)
      */
     private boolean hasFineLocationPermission() {
         return checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
@@ -398,17 +419,14 @@ public final class MainActivity extends Activity {
     }
 
     /*
+     * change(add)-hyungchul-20260522-1103: 누락된 함수 주석 추가
      * 함수명: hasCoarseLocationPermission
      * 목적 및 기능:
-     * - ACCESS_COARSE_LOCATION이 grant되었는지 확인한다.
-     * - FINE이 필요하지만 permission 상태 debug를 위해 별도 확인한다.
+     * - 앱이 ACCESS_COARSE_LOCATION(대략적 위치) 권한을 획득했는지 확인한다.
      *
-     * 입력 변수/출력 변수:
-     * - 없음
-     *
-     * 리턴 값:
-     * - true: ACCESS_COARSE_LOCATION grant됨
-     * - false: ACCESS_COARSE_LOCATION grant 안 됨
+     * 입력 변수: 없음
+     * 출력 변수/리턴 값:
+     * - boolean: true(권한 있음), false(권한 없음)
      */
     private boolean hasCoarseLocationPermission() {
         return checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
@@ -425,6 +443,7 @@ public final class MainActivity extends Activity {
      * - 없음
      */
     private void requestNeededPermissions() {
+        // 요청해야 할 권한을 담을 리스트 구성
         ArrayList<String> permissions = new ArrayList<>();
 
         if (!hasFineLocationPermission()) {
@@ -435,6 +454,7 @@ public final class MainActivity extends Activity {
             permissions.add(Manifest.permission.ACCESS_COARSE_LOCATION);
         }
 
+        // 안드로이드 12 이상 기기를 위한 추가 블루투스 권한 확인 및 리스트 추가
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             if (checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
                 permissions.add(Manifest.permission.BLUETOOTH_SCAN);
@@ -445,11 +465,12 @@ public final class MainActivity extends Activity {
             }
         }
 
+        // 부족한 권한이 있다면 시스템 다이얼로그를 통해 런타임 요청 수행
         if (!permissions.isEmpty()) {
-            appendLog("Request permissions: " + permissions);
+            appendStatus("Request permissions: " + permissions);
             requestPermissions(permissions.toArray(new String[0]), REQ_PERMISSIONS);
         } else {
-            appendLog("All required permissions already granted.");
+            appendStatus("All required permissions already granted.");
         }
     }
 
@@ -463,8 +484,7 @@ public final class MainActivity extends Activity {
      * - 없음
      *
      * 리턴 값:
-     * - true: Location service ON
-     * - false: Location service OFF
+     * - boolean: true(Location service ON), false(Location service OFF)
      */
     private boolean isLocationServiceEnabled() {
         LocationManager locationManager = (LocationManager) getSystemService(LOCATION_SERVICE);
@@ -472,10 +492,12 @@ public final class MainActivity extends Activity {
             return false;
         }
 
+        // 안드로이드 9(API 28) 이상에서는 제공된 통합 API 사용
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             return locationManager.isLocationEnabled();
         }
 
+        // 하위 버전 호환: GPS 또는 Network 프로바이더가 활성화되어 있는지 확인
         boolean gpsEnabled = false;
         boolean networkEnabled = false;
 
@@ -493,29 +515,31 @@ public final class MainActivity extends Activity {
     }
 
     /*
+     * change(add)-hyungchul-20260522-1103: 누락된 함수 주석 추가
      * 함수명: openLocationSettings
      * 목적 및 기능:
-     * - Location service가 꺼져 있을 때 사용자가 켤 수 있도록 설정 화면을 연다.
+     * - 위치 서비스가 비활성화된 경우 사용자가 직접 켤 수 있도록 시스템 위치 설정 화면을 호출한다.
      *
-     * 입력 변수/출력 변수/리턴 값:
-     * - 없음
+     * 입력 변수: 없음
+     * 출력 변수/리턴 값: 없음
      */
     private void openLocationSettings() {
-        appendLog("Open Location Settings.");
+        appendStatus("Open Location Settings.");
         Intent intent = new Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS);
         startActivity(intent);
     }
 
     /*
+     * change(add)-hyungchul-20260522-1103: 누락된 함수 주석 추가
      * 함수명: openAppSettings
      * 목적 및 기능:
-     * - permission dialog가 다시 뜨지 않는 경우 사용자가 직접 권한을 바꿀 수 있도록 App settings를 연다.
+     * - 앱 권한이 영구 거절되었을 때 사용자가 직접 부여할 수 있도록 애플리케이션 상세 설정 화면을 호출한다.
      *
-     * 입력 변수/출력 변수/리턴 값:
-     * - 없음
+     * 입력 변수: 없음
+     * 출력 변수/리턴 값: 없음
      */
     private void openAppSettings() {
-        appendLog("Open App Settings.");
+        appendStatus("Open App Settings.");
         Intent intent = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
         intent.setData(Uri.parse("package:" + getPackageName()));
         startActivity(intent);
@@ -534,7 +558,7 @@ public final class MainActivity extends Activity {
         boolean coarse = hasCoarseLocationPermission();
         boolean locationOn = isLocationServiceEnabled();
 
-        appendLog("Permission state:"
+        appendStatus("Permission state:"
                 + " FINE=" + fine
                 + ", COARSE=" + coarse
                 + ", LocationON=" + locationOn);
@@ -542,30 +566,44 @@ public final class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             boolean scan = checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED;
             boolean connect = checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED;
-            appendLog("Bluetooth permission state: SCAN=" + scan + ", CONNECT=" + connect);
+            appendStatus("Bluetooth permission state: SCAN=" + scan + ", CONNECT=" + connect);
         }
     }
 
     /*
-     * 함수명: appendLog
+     * 함수명: appendStatus
      * 목적 및 기능:
-     * - 화면 logView에 timestamp가 포함된 log를 출력한다.
+     * - 화면 statusView에 timestamp가 포함된 최근 상태를 출력한다.
+     * - 너무 많은 text가 쌓이지 않도록 최근 MAX_STATUS_LINES개만 유지한다.
      *
      * 입력 변수:
-     * - message: 출력할 log message
+     * - message: 출력할 status message (문자열)
      *
      * 출력 변수/리턴 값:
      * - 없음
      */
-    private void appendLog(String message) {
+    private void appendStatus(String message) {
+        // 현재 시간을 밀리초 단위까지 포함하여 포맷팅
         String now = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(new Date());
         String line = "[" + now + "] " + message;
-        CharSequence oldText = logView.getText();
 
-        if (oldText == null || oldText.length() == 0) {
-            logView.setText(line);
-        } else {
-            logView.setText(line + "\n" + oldText);
+        // 최신 로그를 리스트의 맨 앞에 추가
+        statusLines.add(0, line);
+        // 최대 라인 수를 초과하면 가장 오래된 로그(맨 뒤)를 제거
+        while (statusLines.size() > MAX_STATUS_LINES) {
+            statusLines.remove(statusLines.size() - 1);
         }
+
+        // 전체 로그를 하나의 문자열로 결합
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < statusLines.size(); i++) {
+            if (i > 0) {
+                builder.append('\n');
+            }
+            builder.append(statusLines.get(i));
+        }
+
+        // 텍스트 뷰 갱신
+        statusView.setText(builder.toString());
     }
 }
