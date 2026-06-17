@@ -112,14 +112,25 @@ public final class QcBleReceiveManager {
     private static final boolean REQUEST_2M_PHY = true;
 
     /*
+     * change(add)-hyungchul-20260612-1730:
+     * Qualcomm 답변에 따라 Central/Client 역할인 Mobile Receive App에서 GATT MTU 512를 요청한다.
+     * 목적은 SW6100/SW6100P BLE LE CoC hardware-offload 연결에서
+     * Target-to-Mobile 방향 LE Data Length가 27 octets가 아닌 251 octets로 자동 설정되는지 확인하는 것이다.
+     */
+    private static final boolean REQUEST_GATT_MTU_FOR_DLE = true;
+    private static final int REQUESTED_GATT_MTU_FOR_DLE = 512;
+    private static final long GATT_MTU_DISCOVERY_FALLBACK_DELAY_MS = 1500L;
+
+    /*
      * Optional hidden API request. Android public API는 CONNECTION_PRIORITY_HIGH만 제공하고
      * 정확한 interval 값을 직접 지정하지 못한다. 이 reflection 요청은 실패할 수 있으므로
+     * change(mod)-hyungchul-20260604-0001: 안정성 실험을 위해 exact interval 요청값을 12 units(15ms)로 맞춘다.
      * 실패해도 기존 public requestConnectionPriority(HIGH) 경로는 그대로 유지된다.
      * 단위: connection interval = N * 1.25ms, supervision timeout = N * 10ms.
      */
     private static final boolean REQUEST_EXACT_LE_CONNECTION_UPDATE = true;
-    private static final int EXACT_CONN_MIN_INTERVAL_UNITS = 6;     // 7.5 ms
-    private static final int EXACT_CONN_MAX_INTERVAL_UNITS = 8;     // 10.0 ms
+    private static final int EXACT_CONN_MIN_INTERVAL_UNITS = 12;    // change(mod)-hyungchul-20260604-0001: 15.0 ms
+    private static final int EXACT_CONN_MAX_INTERVAL_UNITS = 12;    // change(mod)-hyungchul-20260604-0001: 15.0 ms
     private static final int EXACT_CONN_LATENCY = 0;
     private static final int EXACT_CONN_SUPERVISION_TIMEOUT_UNITS = 500; // 5 s
     private static final int EXACT_CONN_MIN_CE_LEN = 0;
@@ -142,6 +153,11 @@ public final class QcBleReceiveManager {
     private volatile boolean scanning; // 현재 스캔 진행 여부 플래그
     private volatile boolean l2capConnected; // L2CAP 소켓 연결 상태 플래그
 
+    /*
+     * change(add)-hyungchul-20260612-1730:
+     * requestMtu(512) 이후 service discovery가 중복 실행되지 않도록 상태를 추적한다.
+     */
+    private volatile boolean serviceDiscoveryStarted;
     // 수신 및 조립(Assembly) 상태를 추적하기 위한 변수들
     private byte[] streamPending = new byte[0]; // 불완전 수신된 남은 L2CAP 스트림 데이터 버퍼
     private long assemblingImageId = -1L; // 조립 중인 이미지의 고유 ID
@@ -292,6 +308,11 @@ public final class QcBleReceiveManager {
         }
         gatt = null;
 
+        /*
+         * change(add)-hyungchul-20260612-1730:
+         * GATT MTU 512 실험을 위해 service discovery 중복 방지 상태를 초기화한다.
+         */
+        serviceDiscoveryStarted = false;
         // 진행 중이던 수신 버퍼 락 획득 후 초기화
         synchronized (rxLock) {
             resetReceiveStateLocked();
@@ -515,18 +536,28 @@ public final class QcBleReceiveManager {
             log("GATT state changed. status=" + status + ", newState=" + newState);
 
             if (newState == BluetoothProfile.STATE_CONNECTED) {
+                /*
+                 * change(add)-hyungchul-20260612-1730:
+                 * 새 GATT 연결이 시작되었으므로 service discovery 상태를 초기화한다.
+                 */
+                serviceDiscoveryStarted = false;
+
                 requestHighThroughputConnectionParams(gatt, "gatt-connected");
                 scheduleHighThroughputConnectionParamsRetry(gatt);
 
-                try {
-                    // GATT 연결 성공 시, 해당 디바이스가 지원하는 서비스 탐색 시작
-                    boolean started = gatt.discoverServices();
-                    log("GATT discoverServices started=" + started);
-                } catch (SecurityException e) {
-                    log("discoverServices SecurityException: " + e);
+                /*
+                 * change(add)-hyungchul-20260612-1730:
+                 * Qualcomm 답변에 따라 Central/Client에서 GATT MTU 512를 먼저 요청한다.
+                 * requestMtu(512)가 시작되면 onMtuChanged() 이후 service discovery를 수행한다.
+                 * requestMtu(512)가 실패하면 기존처럼 즉시 service discovery를 진행한다.
+                 */
+                boolean mtuRequestStarted = requestGattMtuForDleIfPossible(gatt, "gatt-connected");
+                if (!mtuRequestStarted) {
+                    startServiceDiscoveryOnce(gatt, "mtu-request-not-started");
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 mainHandler.removeCallbacksAndMessages(null);
+                serviceDiscoveryStarted = false;
                 log("GATT disconnected.");
             }
         }
@@ -543,6 +574,21 @@ public final class QcBleReceiveManager {
             log("GATT PHY read. status=" + status
                     + ", txPhy=" + phyToString(txPhy)
                     + ", rxPhy=" + phyToString(rxPhy));
+        }
+
+        /*
+         * change(add)-hyungchul-20260612-1730:
+         * requestMtu(512) 결과를 확인한다.
+         * Qualcomm 답변에 따르면 Central/Client가 MTU 512를 요청하면 DLE 251이 자동 설정되어야 한다.
+         * 실제 DLE 적용 여부는 btsnoop의 LE Data Length Change event에서 확인한다.
+         */
+        @Override
+        public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
+            log("GATT MTU changed. status=" + status
+                    + ", mtu=" + mtu
+                    + ", requestedMtu=" + REQUESTED_GATT_MTU_FOR_DLE);
+
+            startServiceDiscoveryOnce(gatt, "mtu-changed");
         }
 
         @SuppressLint("MissingPermission")
@@ -606,6 +652,108 @@ public final class QcBleReceiveManager {
             handlePsmCharacteristicValue(characteristic.getUuid(), value, status);
         }
     };
+
+    /*
+     * change(add)-hyungchul-20260612-1730:
+     * 함수명: requestGattMtuForDleIfPossible
+     * 목적 및 기능:
+     * - Qualcomm 답변에 따라 Central/Client인 Mobile Receive App에서 GATT MTU 512를 요청한다.
+     * - 이 요청 후 SW6100/SW6100P Target-to-Mobile 방향 DLE가 251 octets로 자동 설정되는지 확인한다.
+     * - requestMtu()가 시작되면 true를 반환하고, 실패하면 false를 반환한다.
+     *
+     * 입력 변수:
+     * - activeGatt: 현재 연결된 BluetoothGatt 객체
+     * - reason: 로그 구분용 문자열
+     *
+     * 출력 변수/리턴 값:
+     * - boolean: true(requestMtu 시작됨), false(requestMtu 시작 실패)
+     */
+    @SuppressLint("MissingPermission")
+    private boolean requestGattMtuForDleIfPossible(BluetoothGatt activeGatt, String reason) {
+        if (!REQUEST_GATT_MTU_FOR_DLE) {
+            return false;
+        }
+
+        if (activeGatt == null) {
+            log("requestMtu skipped: gatt is null. reason=" + reason);
+            return false;
+        }
+
+        if (!hasConnectPermission()) {
+            log("requestMtu skipped: BLUETOOTH_CONNECT permission missing. reason=" + reason);
+            return false;
+        }
+
+        try {
+            boolean started = activeGatt.requestMtu(REQUESTED_GATT_MTU_FOR_DLE);
+            log("requestMtu(" + REQUESTED_GATT_MTU_FOR_DLE + ") reason=" + reason
+                    + ", started=" + started);
+
+            if (started) {
+                /*
+                 * change(add)-hyungchul-20260612-1730:
+                 * 일부 Android stack에서 onMtuChanged() callback이 오지 않을 가능성에 대비해
+                 * fallback으로 일정 시간 후 service discovery를 진행한다.
+                 */
+                mainHandler.postDelayed(() -> {
+                    if (!shutdown.get() && activeGatt == QcBleReceiveManager.this.gatt) {
+                        startServiceDiscoveryOnce(activeGatt, "mtu-fallback-timeout");
+                    }
+                }, GATT_MTU_DISCOVERY_FALLBACK_DELAY_MS);
+            }
+
+            return started;
+        } catch (SecurityException e) {
+            log("requestMtu SecurityException. reason=" + reason + ", error=" + e);
+            return false;
+        } catch (Throwable t) {
+            log("requestMtu failed. reason=" + reason + ", error=" + t);
+            return false;
+        }
+    }
+
+    /*
+     * change(add)-hyungchul-20260612-1730:
+     * 함수명: startServiceDiscoveryOnce
+     * 목적 및 기능:
+     * - requestMtu(512) 이후 service discovery를 한 번만 시작한다.
+     * - onMtuChanged()와 fallback timeout이 동시에 발생해도 discoverServices()가 중복 호출되지 않도록 한다.
+     *
+     * 입력 변수:
+     * - activeGatt: 현재 연결된 BluetoothGatt 객체
+     * - reason: 로그 구분용 문자열
+     *
+     * 출력 변수/리턴 값:
+     * - 없음
+     */
+    @SuppressLint("MissingPermission")
+    private void startServiceDiscoveryOnce(BluetoothGatt activeGatt, String reason) {
+        if (activeGatt == null) {
+            log("discoverServices skipped: gatt is null. reason=" + reason);
+            return;
+        }
+
+        if (!hasConnectPermission()) {
+            log("discoverServices skipped: BLUETOOTH_CONNECT permission missing. reason=" + reason);
+            return;
+        }
+
+        if (serviceDiscoveryStarted) {
+            log("discoverServices skipped: already started. reason=" + reason);
+            return;
+        }
+
+        serviceDiscoveryStarted = true;
+
+        try {
+            boolean started = activeGatt.discoverServices();
+            log("GATT discoverServices started=" + started + ", reason=" + reason);
+        } catch (SecurityException e) {
+            log("discoverServices SecurityException. reason=" + reason + ", error=" + e);
+        } catch (Throwable t) {
+            log("discoverServices failed. reason=" + reason + ", error=" + t);
+        }
+    }
 
     /*
      * 함수명: requestHighThroughputConnectionParams
@@ -1208,6 +1356,10 @@ public final class QcBleReceiveManager {
         assemblingImageId = header.imageId;
         assemblingTotalLen = totalLen;
         assemblingFragCount = fragCount;
+        /*
+         * change(add)-hyungchul-20260611-1530:
+         * JPG 1장 수신 시작 시간을 저장하여 interval별 수신 소요 시간을 계산한다.
+         */
         assemblingImage = new byte[totalLen]; // 실제 파일 크기만큼의 바이트 배열 할당
         assemblingFragReceived = new boolean[fragCount]; // 조각 유실 및 중복 수신 체크용 배열
         assemblingReceivedFragCount = 0;
